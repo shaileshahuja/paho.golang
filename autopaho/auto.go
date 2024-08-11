@@ -107,6 +107,9 @@ type ClientConfig struct {
 
 	// We include the full paho.ClientConfig in order to simplify moving between the two packages.
 	// Note that Conn will be ignored.
+
+	OnQueuedPublishSent func(*paho.Publish) // Callback when a queued publish is sent
+
 	paho.ClientConfig
 }
 
@@ -630,6 +633,9 @@ connectionLoop:
 					default: // retry
 						continue
 					}
+				}
+				if c.cfg.OnQueuedPublishSent != nil {
+					c.cfg.OnQueuedPublishSent(&pub2)
 				}
 				if err := entry.Remove(); err != nil { // successfully published
 					c.errors.Printf("error removing queue entry: %s", err)

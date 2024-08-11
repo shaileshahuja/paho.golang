@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"reflect"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -354,6 +355,144 @@ func TestPreloadPublish(t *testing.T) {
 	case <-got5Messages:
 	case <-time.After(5 * longerDelay): // Need a bit longer...
 		t.Fatalf("timeout awaiting messages (received %d)", publishReceived)
+	}
+
+	// Disconnect
+	disconnectErr := make(chan error)
+	go func() {
+		disconnectErr <- cm.Disconnect(ctx)
+	}()
+	select {
+	case err = <-disconnectErr:
+		if err != nil {
+			t.Fatalf("Disconnect returned error: %s", err)
+		}
+	case <-time.After(longerDelay):
+		t.Fatal("Disconnect should return relatively quickly")
+	}
+
+	// Connection manager should be Done
+	select {
+	case <-cm.Done():
+	case <-time.After(shortDelay):
+		t.Fatal("connection manager should be done after Disconnect Called")
+	}
+
+	// The test server should have picked up the dropped connection
+	select {
+	case <-tsDone:
+	case <-time.After(shortDelay):
+		t.Fatal("test server did not shutdown within expected time")
+	}
+}
+
+// TestQueuedMessagesCallback tests the OnQueuedPublishSent callback
+func TestQueuedMessagesCallback(t *testing.T) {
+	t.Parallel()
+	server, _ := url.Parse(dummyURL)
+	serverLogger := paholog.NewTestLogger(t, "testServer:")
+	logger := paholog.NewTestLogger(t, "test:")
+
+	ts := testserver.New(serverLogger)
+
+	var receivedPublish []*packets.Publish
+	messagesSent := make(chan struct{})
+	messagesReceived := make(chan struct{})
+
+	ts.SetPacketReceivedCallback(func(cp *packets.ControlPacket) error {
+		pub, ok := cp.Content.(*packets.Publish)
+		if !ok {
+			return nil
+		}
+		receivedPublish = append(receivedPublish, pub)
+		if len(receivedPublish) == 5 {
+			close(messagesReceived)
+		}
+		return nil
+	})
+
+	q := memqueue.New()
+	var sentMessages []string
+	var tsDone chan struct{} // Set on AttemptConnection and closed when that test server connection is done
+
+	config := ClientConfig{
+		ServerUrls:        []*url.URL{server},
+		KeepAlive:         0,
+		ConnectRetryDelay: shortDelay,
+		ConnectTimeout:    shortDelay,
+		Queue:             q,
+		AttemptConnection: func(ctx context.Context, _ ClientConfig, _ *url.URL) (net.Conn, error) {
+			var conn net.Conn
+			var err error
+			conn, tsDone, err = ts.Connect(ctx)
+			return conn, err
+		},
+		OnQueuedPublishSent: func(pub *paho.Publish) {
+			sentMessages = append(sentMessages, string(pub.Payload))
+			if len(sentMessages) == 5 {
+				close(messagesSent)
+			}
+		},
+		Debug:      logger,
+		Errors:     logger,
+		PahoDebug:  logger,
+		PahoErrors: logger,
+		ClientConfig: paho.ClientConfig{
+			ClientID: "test",
+			OnPublishReceived: []func(paho.PublishReceived) (bool, error){
+				func(pr paho.PublishReceived) (bool, error) {
+					return true, nil
+				},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), longerDelay)
+	defer cancel()
+	cm, err := NewConnection(ctx, config)
+	if err != nil {
+		t.Fatalf("expected NewConnection success: %s", err)
+	}
+
+	// Queue 5 messages
+	for i := 1; i <= 5; i++ {
+		msg := fmt.Sprintf("Test%d", i)
+		if err = cm.PublishViaQueue(ctx, &QueuePublish{
+			Publish: &paho.Publish{
+				QoS:     1,
+				Topic:   msg,
+				Payload: []byte(msg),
+			},
+		}); err != nil {
+			t.Fatalf("publish %d failed", i)
+		}
+	}
+
+	// Wait for all messages to be sent and received
+	select {
+	case <-messagesSent:
+	case <-time.After(longerDelay):
+		t.Fatal("timeout waiting for messages to be sent")
+	}
+
+	select {
+	case <-messagesReceived:
+	case <-time.After(longerDelay):
+		t.Fatal("timeout waiting for messages to be received")
+	}
+
+	// Check that we received the expected messages in the callback
+	expectedMessages := []string{"Test1", "Test2", "Test3", "Test4", "Test5"}
+	if !reflect.DeepEqual(sentMessages, expectedMessages) {
+		t.Errorf("sent messages do not match expected. Got %v, want %v", sentMessages, expectedMessages)
+	}
+
+	// Check that the server received the expected messages
+	for i, pub := range receivedPublish {
+		expected := fmt.Sprintf("Test%d", i+1)
+		if string(pub.Payload) != expected {
+			t.Errorf("received message %d does not match. Got %s, want %s", i+1, string(pub.Payload), expected)
+		}
 	}
 
 	// Disconnect
